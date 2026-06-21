@@ -488,6 +488,15 @@ async def on_message(message: discord.Message):
                     summary += f"，失敗 {fail} 筆"
                 await status_msg.edit(content=summary)
 
+                # Store import result in chat history so follow-up questions work
+                tx_lines = "\n".join(
+                    f"- {tx.get('date','')} {tx.get('item_name','')} ${tx.get('amount','')}"
+                    for tx in transactions[:ok]
+                )
+                history = chat_history.setdefault(channel_name, [])
+                history.append({"role": "user", "content": f"[系統：剛才匯入了 {ok} 筆交易]"})
+                history.append({"role": "assistant", "content": f"我剛幫你匯入了 {ok} 筆交易記錄到 Notion：\n{tx_lines}"})
+
             except json.JSONDecodeError:
                 await status_msg.edit(content="❌ 解析失敗，可能格式不支援\n若為加密 PDF 請附上：`密碼是XXXX`")
             except Exception as e:
@@ -530,7 +539,11 @@ async def on_message(message: discord.Message):
                 return
             page_id = write_to_notion(db_id, data, account)
             last_page_id[channel_name] = page_id
-            await message.reply(format_confirm(data, account))
+            confirm = format_confirm(data, account)
+            await message.reply(confirm)
+            history = chat_history.setdefault(channel_name, [])
+            history.append({"role": "user", "content": text})
+            history.append({"role": "assistant", "content": confirm})
         except Exception as e:
             await message.reply(f"❌ 錯誤：{e}")
 
