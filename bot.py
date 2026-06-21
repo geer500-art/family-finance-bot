@@ -231,8 +231,11 @@ If not a financial transaction, return {{"error": "not a transaction"}}"""
         messages=[{"role": "user", "content": text}],
     )
     raw = re.sub(r"```[a-z]*\n?", "", msg.content[0].text.strip()).replace("```", "").strip()
-    data = json.loads(raw)
-    return None if "error" in data else data
+    try:
+        data = json.loads(raw)
+        return None if "error" in data else data
+    except json.JSONDecodeError:
+        return None
 
 
 def parse_tabular_transactions(rows_text: str, account: str) -> list[dict]:
@@ -528,8 +531,6 @@ async def on_message(message: discord.Message):
             page_id = write_to_notion(db_id, data, account)
             last_page_id[channel_name] = page_id
             await message.reply(format_confirm(data, account))
-        except json.JSONDecodeError:
-            await message.reply("❌ 解析失敗，請稍後再試")
         except Exception as e:
             await message.reply(f"❌ 錯誤：{e}")
 
