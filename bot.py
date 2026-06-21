@@ -9,7 +9,6 @@ Features:
 - Spending analysis: 分析 / 這個月花了多少 / 類別統計
 """
 
-import base64
 import calendar
 import csv
 import io
@@ -50,6 +49,7 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 
 last_page_id: dict[str, str] = {}
+chat_history: dict[str, list] = {}  # channel_name -> message history
 
 
 # ── Notion helpers ──────────────────────────────────────────────
@@ -290,70 +290,60 @@ def csv_to_text(file_bytes: bytes) -> str:
     return "\n".join("\t".join(row) for row in reader if any(row))
 
 
+def pdf_to_text(pdf_bytes: bytes, password: str = "") -> str:
+    """Extract text from PDF using pypdf, with optional password decryption."""
+    import pypdf
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+    if reader.is_encrypted:
+        result = reader.decrypt(password)
+        if result == pypdf.PasswordType.NOT_DECRYPTED:
+            raise ValueError("PDF 密碼錯誤，無法解密")
+    lines = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
 def parse_pdf_transactions(pdf_bytes: bytes, account: str, password: str = "") -> list[dict]:
-    today = date.today().isoformat()
-    is_joint = account == "joint"
-    categories = (
-        '["家用","旅遊基金","學習教育","投資","其他雜支"]'
-        if is_joint else
-        '["餐飲","交通","娛樂","帳單","購物","醫療","其他"]'
-    )
-    type_field = "" if is_joint else '"type": "支出" or "收入",'
-    income_src = "" if is_joint else '"income_source": one of ["薪資","美股","其他"] (null if 支出),'
-    who_paid   = '"who_paid": one of ["老婆","老公","共同"],' if is_joint else ""
-
-    system = f"""You are a bank statement parser for a Taiwanese family finance app.
-Extract ALL transactions from the PDF bank statement and return a JSON array.
-Today: {today}
-Each item must have:
-- item_name: short description
-- date: YYYY-MM-DD
-- amount: positive number
-{type_field}
-- category: one of {categories}
-{income_src}
-- payment: one of ["信用卡","金融卡","現金","街口","Line Pay","VISA"]
-{who_paid}
-- note: extra info or ""
-
-Return ONLY a valid JSON array. If no transactions found, return []"""
-
-    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-    msg = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=system,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-                    **({"context": f"PDF password: {password}"} if password else {}),
-                },
-                {"type": "text", "text": "請提取這份對帳單中的所有交易記錄，以 JSON 陣列格式回傳。"},
-            ],
-        }],
-    )
-    raw = re.sub(r"```[a-z]*\n?", "", msg.content[0].text.strip()).replace("```", "").strip()
-    return json.loads(raw)
+    text = pdf_to_text(pdf_bytes, password)
+    if not text.strip():
+        raise ValueError("PDF 無法提取文字，可能是掃描版圖片 PDF")
+    return parse_tabular_transactions(text, account)
 
 
 # ── Free chat ───────────────────────────────────────────────────
 
-async def free_chat(text: str, account: str) -> str:
+async def free_chat(text: str, account: str, channel_name: str) -> str:
     account_label = {"wife": "老婆", "hub": "老公", "joint": "公帳"}.get(account, "")
+    history = chat_history.setdefault(channel_name, [])
+    history.append({"role": "user", "content": text})
+    # keep last 20 turns to avoid token overflow
+    if len(history) > 20:
+        history[:] = history[-20:]
     msg = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=f"""你是一個家庭財務助理，也是一個全能助手。
-現在是在 {account_label} 的記帳頻道，用繁體中文回答，語氣親切簡潔。
-可以回答任何問題：財務建議、生活問題、計算、規劃等。
-如果是財務相關問題，適時結合家庭理財角度給建議。
-回答盡量簡潔，重點用條列式，不要太長。""",
-        messages=[{"role": "user", "content": text}],
+        max_tokens=2048,
+        system=f"""你是「富貴號」——楊家的私人財務顧問兼生活助理，個性聰明、親切、有點幽默。
+你在 {account_label} 的記帳頻道服務，但你的能力不限於記帳。
+
+你可以：
+- 幫忙分析家庭財務狀況、規劃預算、解讀對帳單
+- 解答任何生活問題、計算、查詢、翻譯
+- 提供理財建議（台灣視角：定存、ETF、美股、保險等）
+- 閒聊、說笑話、回答各種奇怪問題
+
+回答原則：
+- 用繁體中文，語氣自然像朋友聊天
+- 該詳細就詳細，不要為了簡潔而省掉重要資訊
+- 數字、步驟用條列式；純聊天就自然回應
+- 有記憶，能接續上下文對話""",
+        messages=history,
     )
-    return msg.content[0].text
+    reply = msg.content[0].text
+    history.append({"role": "assistant", "content": reply})
+    return reply
 
 
 # ── Format helpers ──────────────────────────────────────────────
@@ -482,7 +472,7 @@ async def on_message(message: discord.Message):
             data = parse_transaction(text, account)
             if data is None:
                 # Not a transaction — treat as free chat with Claude
-                reply = await free_chat(text, account)
+                reply = await free_chat(text, account, channel_name)
                 await message.reply(reply)
                 return
             page_id = write_to_notion(db_id, data, account)
