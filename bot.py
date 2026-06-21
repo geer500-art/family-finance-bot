@@ -313,6 +313,52 @@ def parse_pdf_transactions(pdf_bytes: bytes, account: str, password: str = "") -
     return parse_tabular_transactions(text, account)
 
 
+def parse_image_transactions(image_bytes: bytes, filename: str, account: str) -> list[dict]:
+    import base64
+    ext = filename.rsplit(".", 1)[-1].lower()
+    media_type_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+    media_type = media_type_map.get(ext, "image/png")
+    today = date.today().isoformat()
+    is_joint = account == "joint"
+    categories = (
+        '["家用","旅遊基金","學習教育","投資","其他雜支"]'
+        if is_joint else
+        '["餐飲","交通","娛樂","帳單","購物","醫療","其他"]'
+    )
+    type_field = "" if is_joint else '"type": "支出" or "收入",'
+    income_src = "" if is_joint else '"income_source": one of ["薪資","美股","其他"] (null if 支出),'
+    who_paid   = '"who_paid": one of ["老婆","老公","共同"],' if is_joint else ""
+    system = f"""You are a bank statement parser for a Taiwanese family finance app.
+Extract ALL transactions from the bank statement image and return a JSON array.
+Today: {today}
+Each item must have:
+- item_name: short description (use 備注/對方帳號 as hint)
+- date: YYYY-MM-DD
+- amount: positive number (支出 from 支出 column, 收入 from 存入 column)
+{type_field}
+- category: one of {categories}
+{income_src}
+- payment: one of ["信用卡","金融卡","現金","街口","Line Pay","VISA"]
+{who_paid}
+- note: extra info or ""
+Return ONLY a valid JSON array. If no transactions found, return []"""
+    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    msg = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                {"type": "text", "text": "請提取這張對帳單截圖中的所有交易記錄，以 JSON 陣列格式回傳。"},
+            ],
+        }],
+    )
+    raw = re.sub(r"```[a-z]*\n?", "", msg.content[0].text.strip()).replace("```", "").strip()
+    return json.loads(raw)
+
+
 # ── Free chat ───────────────────────────────────────────────────
 
 async def free_chat(text: str, account: str, channel_name: str) -> str:
@@ -392,9 +438,10 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
 
-        # ── File attachment (PDF / Excel / CSV) ────────────────
+        # ── File attachment (PDF / Excel / CSV / Image) ────────
         supported = [a for a in message.attachments
-                     if a.filename.lower().endswith((".pdf", ".xlsx", ".xls", ".csv"))]
+                     if a.filename.lower().endswith((".pdf", ".xlsx", ".xls", ".csv",
+                                                     ".png", ".jpg", ".jpeg", ".webp"))]
         if supported:
             att = supported[0]
             fname = att.filename.lower()
@@ -412,9 +459,12 @@ async def on_message(message: discord.Message):
                 elif fname.endswith((".xlsx", ".xls")):
                     transactions = parse_tabular_transactions(excel_to_text(file_bytes), account)
                     file_type = "Excel"
-                else:
+                elif fname.endswith(".csv"):
                     transactions = parse_tabular_transactions(csv_to_text(file_bytes), account)
                     file_type = "CSV"
+                else:
+                    transactions = parse_image_transactions(file_bytes, fname, account)
+                    file_type = "圖片"
 
                 if not transactions:
                     await status_msg.edit(content="⚠️ 找不到任何交易記錄，請確認檔案格式正確。")
