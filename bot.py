@@ -253,11 +253,11 @@ def parse_pdf_transactions(pdf_bytes: bytes, account: str, password: str = "") -
     return parse_tabular_transactions(text, account)
 
 
-def parse_image_transactions(image_bytes: bytes, filename: str, account: str) -> list[dict]:
+def parse_images_transactions(images: list[tuple[bytes, str]], account: str) -> list[dict]:
+    """images: list of (image_bytes, filename). All images are sent in one call
+    so transactions split across multiple screenshots are extracted together."""
     import base64
-    ext = filename.rsplit(".", 1)[-1].lower()
     media_type_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
-    media_type = media_type_map.get(ext, "image/png")
     today = date.today().isoformat()
     is_joint = account == "joint"
     categories = (
@@ -269,7 +269,8 @@ def parse_image_transactions(image_bytes: bytes, filename: str, account: str) ->
     income_src = "" if is_joint else '"income_source": one of ["薪資","美股","其他"] (null if 支出),'
     who_paid   = '"who_paid": one of ["老婆","老公","共同"],' if is_joint else ""
     system = f"""You are a bank statement parser for a Taiwanese family finance app.
-Extract ALL transactions from the bank statement image and return a JSON array.
+You will receive {len(images)} screenshot(s), possibly continuations of the same statement.
+Extract ALL transactions from ALL images and return a single combined JSON array.
 Today: {today}
 Each item must have:
 - item_name: short description (use 備注/對方帳號 as hint)
@@ -281,19 +282,21 @@ Each item must have:
 - payment: one of ["信用卡","金融卡","現金","街口","Line Pay","VISA"]
 {who_paid}
 - note: extra info or ""
-Return ONLY a valid JSON array. If no transactions found, return []"""
-    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+Return ONLY a valid JSON array covering every transaction in every image. If none found, return []"""
+
+    content = []
+    for image_bytes, filename in images:
+        ext = filename.rsplit(".", 1)[-1].lower()
+        media_type = media_type_map.get(ext, "image/png")
+        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}})
+    content.append({"type": "text", "text": "請提取以上所有截圖中的所有交易記錄，合併成一個 JSON 陣列回傳。"})
+
     msg = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
         system=system,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                {"type": "text", "text": "請提取這張對帳單截圖中的所有交易記錄，以 JSON 陣列格式回傳。"},
-            ],
-        }],
+        messages=[{"role": "user", "content": content}],
     )
     raw = re.sub(r"```[a-z]*\n?", "", msg.content[0].text.strip()).replace("```", "").strip()
     return json.loads(raw)
@@ -513,28 +516,39 @@ async def on_message(message: discord.Message):
                      if a.filename.lower().endswith((".pdf", ".xlsx", ".xls", ".csv",
                                                      ".png", ".jpg", ".jpeg", ".webp"))]
         if supported:
-            att = supported[0]
-            fname = att.filename.lower()
             password = ""
             pw_match = re.search(r"密碼[是:：\s]+(\S+)", text)
             if pw_match:
                 password = pw_match.group(1)
 
-            status_msg = await message.reply(f"📄 正在讀取 **{att.filename}**，請稍候…")
+            names = "、".join(a.filename for a in supported)
+            status_msg = await message.reply(f"📄 正在讀取 **{names}**，請稍候…")
             try:
-                file_bytes = await att.read()
-                if fname.endswith(".pdf"):
-                    transactions = parse_pdf_transactions(file_bytes, account, password)
-                    file_type = "PDF"
-                elif fname.endswith((".xlsx", ".xls")):
-                    transactions = parse_tabular_transactions(excel_to_text(file_bytes), account)
-                    file_type = "Excel"
-                elif fname.endswith(".csv"):
-                    transactions = parse_tabular_transactions(csv_to_text(file_bytes), account)
-                    file_type = "CSV"
-                else:
-                    transactions = parse_image_transactions(file_bytes, fname, account)
-                    file_type = "圖片"
+                image_atts = [a for a in supported if a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+                other_atts = [a for a in supported if a not in image_atts]
+
+                transactions: list[dict] = []
+                file_types: list[str] = []
+
+                if image_atts:
+                    images = [(await a.read(), a.filename) for a in image_atts]
+                    transactions += parse_images_transactions(images, account)
+                    file_types.append("圖片")
+
+                for att in other_atts:
+                    fname = att.filename.lower()
+                    file_bytes = await att.read()
+                    if fname.endswith(".pdf"):
+                        transactions += parse_pdf_transactions(file_bytes, account, password)
+                        file_types.append("PDF")
+                    elif fname.endswith((".xlsx", ".xls")):
+                        transactions += parse_tabular_transactions(excel_to_text(file_bytes), account)
+                        file_types.append("Excel")
+                    else:
+                        transactions += parse_tabular_transactions(csv_to_text(file_bytes), account)
+                        file_types.append("CSV")
+
+                file_type = "、".join(dict.fromkeys(file_types))
 
                 if not transactions:
                     await status_msg.edit(content="⚠️ 找不到任何交易記錄，請確認檔案格式正確。")
