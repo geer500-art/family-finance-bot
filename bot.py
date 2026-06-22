@@ -2,11 +2,12 @@
 Discord Bot for natural-language expense/income logging.
 Listens on channels: 老婆私帳, 老公私帳, 公帳
 
-Features:
-- Natural language transaction parsing via Claude
-- Delete last entry: 取消 / 刪除上一筆
-- PDF / Excel / CSV bank statement import
-- Spending analysis: 分析 / 這個月花了多少 / 類別統計
+Every text message goes straight to Claude (tool use). Claude decides whether to
+log a transaction, cancel the last entry, confirm a pending import, analyze
+spending, or just chat — there is no keyword/regex routing for text.
+
+File attachments (PDF / Excel / CSV / image) are parsed into a preview and
+held as a pending import until the user confirms via chat.
 """
 
 import calendar
@@ -50,6 +51,7 @@ bot = discord.Client(intents=intents)
 
 last_page_id: dict[str, str] = {}
 chat_history: dict[str, list] = {}  # channel_name -> message history
+pending_imports: dict[str, dict] = {}  # channel_name -> {transactions, file_type, db_id}
 
 
 # ── Notion helpers ──────────────────────────────────────────────
@@ -132,16 +134,6 @@ def delete_notion_page(page_id: str) -> None:
 
 # ── Analysis ────────────────────────────────────────────────────
 
-ANALYSIS_KEYWORDS = [
-    "分析", "統計", "花了多少", "支出", "收入", "這個月", "上個月",
-    "本月", "今年", "比較", "類別", "帳單", "總結", "報告", "幫我看",
-    "消費", "結餘", "剩多少", "存了多少",
-]
-
-def is_analysis_request(text: str) -> bool:
-    return any(k in text for k in ANALYSIS_KEYWORDS)
-
-
 def fetch_month_data(db_id: str, year: int, month: int) -> list[dict]:
     last_day = calendar.monthrange(year, month)[1]
     start = f"{year}-{month:02d}-01"
@@ -168,75 +160,20 @@ def build_analysis_context(pages: list[dict], account: str) -> str:
     return "\n".join(rows) if rows else "（無資料）"
 
 
-async def do_analysis(text: str, db_id: str, account: str) -> str:
+def fetch_period_context(period: str, db_id: str, account: str) -> str:
     today = date.today()
     year, month = today.year, today.month
-
-    # Detect if asking about last month
-    if "上個月" in text or "上月" in text:
+    if period == "last_month":
         month -= 1
         if month == 0:
             month, year = 12, year - 1
-
     pages = fetch_month_data(db_id, year, month)
     context = build_analysis_context(pages, account)
     month_label = f"{year}年{month}月"
-
-    msg = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=f"""你是一個家庭財務分析助理，用繁體中文回答，語氣親切簡潔。
-分析以下 {month_label} 的帳務資料，回答用戶的問題。
-格式：條列式，重點數字加粗，最後給一句建議。
-帳務資料（日期 | 項目 | 類型 | 類別 | 金額 | 付款方式）：
-{context}""",
-        messages=[{"role": "user", "content": text}],
-    )
-    return f"📊 **{month_label} 帳務分析**\n\n{msg.content[0].text}"
+    return f"{month_label} 帳務資料（日期 | 項目 | 類型 | 類別 | 金額 | 付款方式）：\n{context}"
 
 
-# ── Claude parsers ──────────────────────────────────────────────
-
-def parse_transaction(text: str, account: str) -> dict | None:
-    today = date.today().isoformat()
-    is_joint = account == "joint"
-    categories = (
-        '["家用","旅遊基金","學習教育","投資","其他雜支"]'
-        if is_joint else
-        '["餐飲","交通","娛樂","帳單","購物","醫療","其他"]'
-    )
-    type_field = "" if is_joint else '"type": "支出" or "收入",'
-    income_src = "" if is_joint else '"income_source": one of ["薪資","美股","其他"] (null if 支出),'
-    who_paid   = '"who_paid": one of ["老婆","老公","共同"],' if is_joint else ""
-
-    system = f"""You parse Chinese financial messages for a family finance app.
-Today: {today}
-Return ONLY valid JSON with:
-- item_name: short description
-- date: YYYY-MM-DD (default today)
-- amount: positive number
-{type_field}
-- category: one of {categories}
-{income_src}
-- payment: one of ["信用卡","金融卡","現金","街口","Line Pay","VISA"] (guess or default "信用卡")
-{who_paid}
-- note: extra info or ""
-
-If not a financial transaction, return {{"error": "not a transaction"}}"""
-
-    msg = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=system,
-        messages=[{"role": "user", "content": text}],
-    )
-    raw = re.sub(r"```[a-z]*\n?", "", msg.content[0].text.strip()).replace("```", "").strip()
-    try:
-        data = json.loads(raw)
-        return None if "error" in data else data
-    except json.JSONDecodeError:
-        return None
-
+# ── File parsers ──────────────────────────────────────────────
 
 def parse_tabular_transactions(rows_text: str, account: str) -> list[dict]:
     today = date.today().isoformat()
@@ -362,45 +299,6 @@ Return ONLY a valid JSON array. If no transactions found, return []"""
     return json.loads(raw)
 
 
-# ── Free chat ───────────────────────────────────────────────────
-
-async def free_chat(text: str, account: str, channel_name: str) -> str:
-    account_label = {"wife": "老婆", "hub": "老公", "joint": "公帳"}.get(account, "")
-    history = chat_history.setdefault(channel_name, [])
-    history.append({"role": "user", "content": text})
-    # keep last 20 turns to avoid token overflow
-    if len(history) > 20:
-        history[:] = history[-20:]
-    msg = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        system=f"""你是「富貴號」——楊家的私人財務顧問兼生活助理，個性聰明、親切、有點幽默。
-你在 {account_label} 的記帳頻道服務，但你的能力不限於記帳。
-
-【你的真實能力】
-- 你確實連接了 Notion 資料庫，可以幫使用者記帳、匯入對帳單
-- 使用者說記帳或傳檔案時，系統會自動寫入 Notion
-- 但你只記得「這次對話」裡發生的事；重新啟動後之前的對話記憶會消失
-- 如果使用者問你「剛才匯入了什麼」但你不記得，誠實說你這次對話沒有記錄到，請他再傳一次或直接問 Notion
-
-你也可以：
-- 幫忙分析家庭財務狀況、規劃預算、解讀對帳單
-- 解答任何生活問題、計算、查詢、翻譯
-- 提供理財建議（台灣視角：定存、ETF、美股、保險等）
-- 閒聊、說笑話、回答各種奇怪問題
-
-回答原則：
-- 用繁體中文，語氣自然像朋友聊天
-- 該詳細就詳細，不要為了簡潔而省掉重要資訊
-- 數字、步驟用條列式；純聊天就自然回應
-- 不要說「我沒有連接任何系統」，因為你確實有""",
-        messages=history,
-    )
-    reply = msg.content[0].text
-    history.append({"role": "assistant", "content": reply})
-    return reply
-
-
 # ── Format helpers ──────────────────────────────────────────────
 
 def format_confirm(data: dict, account: str) -> str:
@@ -423,8 +321,171 @@ def format_confirm(data: dict, account: str) -> str:
     return "\n".join(lines)
 
 
-def is_cancel_command(text: str) -> bool:
-    return any(k in text for k in ["取消", "刪除上一筆", "刪掉上一筆", "undo", "cancel", "刪除", "取消上一筆"])
+def format_import_preview(transactions: list[dict], account: str, file_type: str) -> str:
+    lines = [f"📄 從 **{file_type}** 找到 **{len(transactions)}** 筆交易，整理如下：\n"]
+    for i, tx in enumerate(transactions, 1):
+        amt = tx.get("amount", 0)
+        sign = "+" if tx.get("type") == "收入" else "-"
+        extra = f"（{tx.get('category','')}）" if account in ("wife", "hub") else f"（{tx.get('who_paid','共同')}）"
+        lines.append(f"{i}. {tx.get('date','')} {tx.get('item_name','')} {sign}${amt:,} {extra}")
+    lines.append("\n跟我說「確認」就會記錄，或告訴我要改哪一筆／取消。")
+    return "\n".join(lines)
+
+
+# ── Claude tools ──────────────────────────────────────────────
+
+def build_tools(account: str) -> list[dict]:
+    is_joint = account == "joint"
+    categories = (
+        ["家用", "旅遊基金", "學習教育", "投資", "其他雜支"]
+        if is_joint else
+        ["餐飲", "交通", "娛樂", "帳單", "購物", "醫療", "其他"]
+    )
+    properties = {
+        "item_name": {"type": "string", "description": "項目簡述"},
+        "date": {"type": "string", "description": "YYYY-MM-DD，沒提到就用今天"},
+        "amount": {"type": "number", "description": "金額，正數"},
+        "category": {"type": "string", "enum": categories},
+        "payment": {"type": "string", "enum": ["信用卡", "金融卡", "現金", "街口", "Line Pay", "VISA"]},
+        "note": {"type": "string", "description": "額外備註，沒有就空字串"},
+    }
+    required = ["item_name", "date", "amount", "category"]
+    if is_joint:
+        properties["who_paid"] = {"type": "string", "enum": ["老婆", "老公", "共同"]}
+    else:
+        properties["type"] = {"type": "string", "enum": ["支出", "收入"]}
+        properties["income_source"] = {"type": "string", "enum": ["薪資", "美股", "其他"]}
+        required.append("type")
+
+    return [
+        {
+            "name": "log_transaction",
+            "description": "記一筆收入或支出到記帳系統。當使用者描述一筆消費或收入時呼叫（例如「吃飯185」「薪水入帳5萬」）。",
+            "input_schema": {"type": "object", "properties": properties, "required": required},
+        },
+        {
+            "name": "cancel_last",
+            "description": "取消/刪除上一筆已記錄的交易，或捨棄目前等待確認的匯入內容。當使用者說取消、刪除上一筆時呼叫。",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "confirm_pending_import",
+            "description": "當使用者確認要把先前匯入預覽（PDF/Excel/CSV/圖片）的交易寫入記帳系統時呼叫，例如使用者說「確認」「好，記錄」。",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "analyze_spending",
+            "description": "查詢某段期間的帳務原始資料，用於回答花了多少、結餘多少、類別統計等問題。呼叫後你會拿到原始交易清單，自己整理分析。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "period": {"type": "string", "enum": ["this_month", "last_month"], "description": "要查詢的月份"},
+                },
+                "required": ["period"],
+            },
+        },
+    ]
+
+
+async def run_tool(name: str, tool_input: dict, account: str, channel_name: str, db_id: str) -> str:
+    if name == "log_transaction":
+        try:
+            page_id = write_to_notion(db_id, tool_input, account)
+            last_page_id[channel_name] = page_id
+            return json.dumps({"success": True, "confirmation_text": format_confirm(tool_input, account)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+    if name == "cancel_last":
+        if channel_name in pending_imports:
+            pending_imports.pop(channel_name)
+            return json.dumps({"success": True, "message": "已取消等待確認的匯入，沒有寫入任何資料"}, ensure_ascii=False)
+        page_id = last_page_id.get(channel_name)
+        if not page_id:
+            return json.dumps({"success": False, "message": "找不到上一筆記錄，無法取消"}, ensure_ascii=False)
+        try:
+            delete_notion_page(page_id)
+            last_page_id.pop(channel_name, None)
+            return json.dumps({"success": True, "message": "已刪除上一筆記錄"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+    if name == "confirm_pending_import":
+        pending = pending_imports.pop(channel_name, None)
+        if not pending:
+            return json.dumps({"success": False, "message": "目前沒有等待確認的匯入"}, ensure_ascii=False)
+        transactions, file_type, pdb_id = pending["transactions"], pending["file_type"], pending["db_id"]
+        ok, fail = 0, 0
+        for tx in transactions:
+            try:
+                page_id = write_to_notion(pdb_id, tx, account)
+                last_page_id[channel_name] = page_id
+                ok += 1
+            except Exception:
+                fail += 1
+        return json.dumps({"success": True, "imported": ok, "failed": fail, "file_type": file_type}, ensure_ascii=False)
+
+    if name == "analyze_spending":
+        period = tool_input.get("period", "this_month")
+        try:
+            context = fetch_period_context(period, db_id, account)
+            return context
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+    return json.dumps({"error": f"unknown tool {name}"}, ensure_ascii=False)
+
+
+SYSTEM_TEMPLATE = """你是「富貴號」——楊家的私人財務顧問兼生活助理，個性聰明、親切、有點幽默。
+你在 {account_label} 的記帳頻道服務，用繁體中文回答，語氣自然像朋友聊天。
+
+你有以下工具，請主動判斷並呼叫，不要只是嘴上說要做：
+- log_transaction：使用者描述一筆消費或收入時呼叫，幫他記到 Notion
+- cancel_last：使用者要取消、刪除上一筆記錄，或捨棄剛才匯入預覽時呼叫
+- confirm_pending_import：使用者確認要寫入先前匯入預覽的交易時呼叫
+- analyze_spending：使用者問花費、結餘、類別統計等問題時呼叫，拿到原始資料後自己整理分析回答（條列式，重點數字加粗，最後給一句建議）
+
+其他情況（純聊天、生活問題、理財建議、計算等）直接自然回答，不要呼叫工具。
+回答盡量完整，不要為了精簡而省略重要資訊；純聊天就輕鬆自然。"""
+
+
+async def handle_chat(text: str, account: str, channel_name: str, db_id: str) -> str:
+    account_label = {"wife": "老婆", "hub": "老公", "joint": "公帳"}.get(account, "")
+    history = chat_history.setdefault(channel_name, [])
+    history.append({"role": "user", "content": text})
+    if len(history) > 30:
+        history[:] = history[-30:]
+
+    tools = build_tools(account)
+    system = SYSTEM_TEMPLATE.format(account_label=account_label)
+
+    for _ in range(4):
+        msg = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=system,
+            tools=tools,
+            messages=history,
+        )
+        history.append({"role": "assistant", "content": msg.content})
+
+        if msg.stop_reason != "tool_use":
+            reply = "".join(b.text for b in msg.content if b.type == "text")
+            return reply or "（沒有內容）"
+
+        tool_results = []
+        for block in msg.content:
+            if block.type != "tool_use":
+                continue
+            result_text = await run_tool(block.name, block.input, account, channel_name, db_id)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_text,
+            })
+        history.append({"role": "user", "content": tool_results})
+
+    return "處理時遇到問題，請再試一次。"
 
 
 # ── Bot events ──────────────────────────────────────────────────
@@ -447,7 +508,7 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
 
-        # ── File attachment (PDF / Excel / CSV / Image) ────────
+        # ── File attachment (PDF / Excel / CSV / Image) → preview ──
         supported = [a for a in message.attachments
                      if a.filename.lower().endswith((".pdf", ".xlsx", ".xls", ".csv",
                                                      ".png", ".jpg", ".jpeg", ".webp"))]
@@ -479,29 +540,12 @@ async def on_message(message: discord.Message):
                     await status_msg.edit(content="⚠️ 找不到任何交易記錄，請確認檔案格式正確。")
                     return
 
-                await status_msg.edit(content=f"📄 找到 **{len(transactions)}** 筆記錄，匯入中…")
-                ok, fail = 0, 0
-                for tx in transactions:
-                    try:
-                        page_id = write_to_notion(db_id, tx, account)
-                        last_page_id[channel_name] = page_id
-                        ok += 1
-                    except Exception:
-                        fail += 1
+                pending_imports[channel_name] = {"transactions": transactions, "file_type": file_type, "db_id": db_id}
+                await status_msg.edit(content=format_import_preview(transactions, account, file_type))
 
-                summary = f"✅ {file_type} 匯入完成！成功 **{ok}** 筆"
-                if fail:
-                    summary += f"，失敗 {fail} 筆"
-                await status_msg.edit(content=summary)
-
-                # Store import result in chat history so follow-up questions work
-                tx_lines = "\n".join(
-                    f"- {tx.get('date','')} {tx.get('item_name','')} ${tx.get('amount','')}"
-                    for tx in transactions[:ok]
-                )
                 history = chat_history.setdefault(channel_name, [])
-                history.append({"role": "user", "content": f"[系統：剛才匯入了 {ok} 筆交易]"})
-                history.append({"role": "assistant", "content": f"我剛幫你匯入了 {ok} 筆交易記錄到 Notion：\n{tx_lines}"})
+                history.append({"role": "user", "content": f"[系統：使用者上傳了 {file_type}，已解析出 {len(transactions)} 筆交易等待確認]"})
+                history.append({"role": "assistant", "content": "好，我已經整理好預覽了，等使用者確認。"})
 
             except json.JSONDecodeError:
                 await status_msg.edit(content="❌ 解析失敗，可能格式不支援\n若為加密 PDF 請附上：`密碼是XXXX`")
@@ -512,44 +556,10 @@ async def on_message(message: discord.Message):
         if not text:
             return
 
-        # ── Cancel / undo ────────────────────────────────────────
-        if is_cancel_command(text):
-            page_id = last_page_id.get(channel_name)
-            if not page_id:
-                await message.reply("⚠️ 找不到上一筆記錄，無法取消。")
-                return
-            try:
-                delete_notion_page(page_id)
-                last_page_id.pop(channel_name, None)
-                await message.reply("🗑️ 上一筆記錄已刪除！")
-            except Exception as e:
-                await message.reply(f"❌ 刪除失敗：{e}")
-            return
-
-        # ── Analysis ─────────────────────────────────────────────
-        if is_analysis_request(text):
-            try:
-                result = await do_analysis(text, db_id, account)
-                await message.reply(result)
-            except Exception as e:
-                await message.reply(f"❌ 分析失敗：{e}")
-            return
-
-        # ── Normal transaction or free chat ─────────────────────
+        # ── Everything else goes straight to Claude (tool use) ──
         try:
-            data = parse_transaction(text, account)
-            if data is None:
-                # Not a transaction — treat as free chat with Claude
-                reply = await free_chat(text, account, channel_name)
-                await message.reply(reply)
-                return
-            page_id = write_to_notion(db_id, data, account)
-            last_page_id[channel_name] = page_id
-            confirm = format_confirm(data, account)
-            await message.reply(confirm)
-            history = chat_history.setdefault(channel_name, [])
-            history.append({"role": "user", "content": text})
-            history.append({"role": "assistant", "content": confirm})
+            reply = await handle_chat(text, account, channel_name, db_id)
+            await message.reply(reply)
         except Exception as e:
             await message.reply(f"❌ 錯誤：{e}")
 
